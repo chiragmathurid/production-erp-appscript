@@ -1,0 +1,1142 @@
+<script>
+/* =====================================================================
+ * Sweets Factory ERP — client
+ * ===================================================================== */
+
+const ROLE_TABS = {
+  sales: ['new', 'orders'],
+  production: ['production'],
+  packing: ['packing'],
+  dispatch: ['dispatch'],
+  accounts: ['orders'],
+  admin: ['orders', 'new', 'production', 'packing', 'dispatch', 'users', 'settings']
+};
+const TAB_LABEL = {
+  new: 'New Order', orders: 'All Orders', production: 'Production', packing: 'Packing',
+  dispatch: 'Dispatch', users: 'Users', settings: 'Masters & Settings'
+};
+// sections shown in each work queue, in display order; a third value `true` = upcoming (view only)
+const QUEUE_SECTIONS = {
+  production: [['IN_PRODUCTION', 'In production'], ['NEW', 'New orders — accept to start']],
+  packing: [['IN_PACKING', 'In packing'], ['PRODUCED', 'Produced — accept to start packing'],
+    ['IN_PRODUCTION', 'Upcoming — in production', true], ['NEW', 'Upcoming — waiting for production', true]],
+  dispatch: [['IN_DISPATCH', 'Loading / assign vehicle'], ['PACKED', 'Packed — accept for dispatch'], ['DISPATCHED', 'On the way — mark delivered'],
+    ['IN_PACKING', 'Upcoming — in packing', true], ['PRODUCED', 'Upcoming — waiting for packing', true],
+    ['IN_PRODUCTION', 'Upcoming — in production', true], ['NEW', 'Upcoming — waiting for production', true]]
+};
+const PRINT_TITLE = { production: 'Production Slip', packing: 'Packing Slip', dispatch: 'Delivery Challan', full: 'Order Summary' };
+const STATUS_LABEL = {
+  NEW: 'Waiting for Production', IN_PRODUCTION: 'In Production', PRODUCED: 'Waiting for Packing',
+  IN_PACKING: 'In Packing', PACKED: 'Ready for Dispatch', IN_DISPATCH: 'Dispatch Loading',
+  DISPATCHED: 'Dispatched', DELIVERED: 'Delivered', CANCELLED: 'Cancelled'
+};
+const ACTION_LABEL = {
+  ORDER_CREATED: 'Order created', ORDER_EDITED: 'Order edited',
+  PROD_ACCEPT: 'Production accepted', PROD_SAVE: 'Production progress saved', PROD_FINISH: 'Production finished',
+  PACK_ACCEPT: 'Packing accepted', PACK_SAVE: 'Packing progress saved', PACK_FINISH: 'Packing finished',
+  DISP_ACCEPT: 'Dispatch accepted', DISP_SEND: 'Dispatched', DELIVERED: 'Delivered',
+  CANCELLED: 'Cancelled', STATUS_OVERRIDE: 'Status changed by admin'
+};
+
+const S = {
+  token: null, data: null, tab: null,
+  filter: { status: '', q: '', from: '', to: '' },
+  editing: null,          // order being edited in the form
+  formImage: null,        // { name, mimeType, data, preview }
+  dirty: new Set(),       // order ids with unsaved inputs in a queue card
+  admin: null,            // admin data (users, sweets, settings)
+  editUser: null,
+  loading: 0
+};
+
+/* ---------------- utilities ---------------- */
+
+const $ = (sel, root) => (root || document).querySelector(sel);
+const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
+
+function h(v) {
+  return String(v === undefined || v === null ? '' : v)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+function fmt(n) {
+  const x = Number(n) || 0;
+  return (Math.round(x * 1000) / 1000).toLocaleString('en-IN', { maximumFractionDigits: 3 });
+}
+function inr(n) {
+  return '₹' + (Number(n) || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+function round2(n) { return Math.round((Number(n) || 0) * 100) / 100; }
+/** Same maths as orderTotals_ on the server. items use Weight / Rate (sheet names). */
+function calcTotals(items, discountPercent) {
+  const subtotal = round2(items.reduce((t, it) => t + round2((Number(it.Weight) || 0) * (Number(it.Rate) || 0)), 0));
+  const pct = Number(discountPercent) || 0;
+  const discount = round2(subtotal * pct / 100);
+  return { subtotal: subtotal, pct: pct, discount: discount, grandTotal: round2(subtotal - discount) };
+}
+function orderMoney(o) { return calcTotals(o.items, o.DiscountPercent); }
+function showPrices() { return ['production', 'packing', 'dispatch'].indexOf(role()) < 0; }
+function store(key, val) {
+  try { if (val === undefined) return localStorage.getItem(key); if (val === null) localStorage.removeItem(key); else localStorage.setItem(key, val); }
+  catch (e) { return null; }
+}
+function todayStr(offsetDays) {
+  const d = new Date(); d.setDate(d.getDate() + (offsetDays || 0));
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
+function niceDate(s) {
+  if (!s) return '';
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(s);
+  if (!m) return s;
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  return Number(m[3]) + ' ' + months[Number(m[2]) - 1] + ' ' + m[1];
+}
+function niceTime(t) {
+  const m = /^(\d{2}):(\d{2})/.exec(t || '');
+  if (!m) return t || '';
+  let hh = Number(m[1]); const ap = hh >= 12 ? 'PM' : 'AM'; hh = hh % 12 || 12;
+  return hh + ':' + m[2] + ' ' + ap;
+}
+function dueHtml(o) {
+  if (!o.DeliveryDate) return '';
+  const closed = o.Status === 'DELIVERED' || o.Status === 'CANCELLED';
+  const d = o.DeliveryDate, t = todayStr(0);
+  let cls = '', tag = '';
+  if (!closed && d < t) { cls = 'due-over'; tag = 'Overdue · '; }
+  else if (!closed && d === t) { cls = 'due-today'; tag = 'Today · '; }
+  else if (!closed && d === todayStr(1)) { tag = 'Tomorrow · '; }
+  return '<span class="due ' + cls + '">🚚 ' + tag + h(niceDate(d)) + ' ' + h(niceTime(o.DeliveryTime)) + '</span>';
+}
+function statusBadge(st) { return '<span class="badge st-' + h(st) + '">' + h(STATUS_LABEL[st] || st) + '</span>'; }
+function progressBadge(label, val) {
+  if (!val || val === 'Pending') return '';
+  return '<span class="badge ' + (val === 'Full' ? 'b-full' : 'b-partial') + '">' + h(label) + ': ' + h(val) + '</span>';
+}
+function itemsSummary(o) { return o.items.map(it => it.SweetName + ' ' + fmt(it.Weight) + 'kg').join(', '); }
+function findOrder(id) { return S.data.orders.find(o => o.OrderID === id); }
+function role() { return S.data && S.data.user.role; }
+function isAdmin() { return role() === 'admin'; }
+
+function loading(delta) {
+  S.loading = Math.max(0, S.loading + delta);
+  $('#loader').classList.toggle('hidden', S.loading === 0);
+}
+let toastTimer;
+function toast(msg, isErr) {
+  const t = $('#toast');
+  t.textContent = msg; t.className = isErr ? 'err' : '';
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.add('hidden'), isErr ? 7000 : 3500);
+}
+
+/** google.script.run as a promise. */
+function api(fn) {
+  const args = Array.prototype.slice.call(arguments, 1);
+  return new Promise((resolve, reject) => {
+    loading(1);
+    google.script.run
+      .withSuccessHandler(r => { loading(-1); resolve(r); })
+      .withFailureHandler(e => {
+        loading(-1);
+        const msg = String((e && e.message) || e).replace(/^Error:\s*/, '');
+        if (msg.indexOf('SESSION_EXPIRED') >= 0) { forceLogout('Your session expired. Please sign in again.'); }
+        reject(new Error(msg));
+      })[fn].apply(null, args);
+  });
+}
+
+/** Small promise-based dialog (avoids relying on window.confirm/prompt inside the iframe). */
+function ask(message, opts) {
+  opts = opts || {};
+  return new Promise(resolve => {
+    const bg = document.createElement('div');
+    bg.className = 'modal-bg'; bg.style.zIndex = 80;
+    bg.innerHTML =
+      '<div class="modal" style="max-width:420px">' +
+      '<p style="white-space:pre-line;margin-top:0">' + h(message) + '</p>' +
+      (opts.input ? '<input id="askInput" placeholder="' + h(opts.placeholder || '') + '">' : '') +
+      '<div class="actions" style="justify-content:flex-end">' +
+      '<button data-a="no">Cancel</button>' +
+      '<button data-a="yes" class="' + (opts.danger ? 'btn-bad' : 'btn-primary') + '">' + h(opts.ok || 'OK') + '</button>' +
+      '</div></div>';
+    document.body.appendChild(bg);
+    const input = $('#askInput', bg);
+    if (input) input.focus();
+    bg.addEventListener('click', e => {
+      const a = e.target.getAttribute && e.target.getAttribute('data-a');
+      if (!a && e.target !== bg) return;
+      const yes = a === 'yes';
+      if (yes && opts.input && opts.required && !input.value.trim()) { input.focus(); return; }
+      bg.remove();
+      resolve(yes ? (opts.input ? input.value.trim() : true) : (opts.input ? null : false));
+    });
+  });
+}
+
+/* ---------------- auth ---------------- */
+
+function showLogin(msg) {
+  $('#appView').classList.add('hidden');
+  $('#loginView').classList.remove('hidden');
+  closeModal();
+  if (msg) toast(msg, true);
+  setTimeout(() => $('#lgUser').focus(), 50);
+}
+function forceLogout(msg) {
+  S.token = null; S.data = null; store('erp_token', null);
+  showLogin(msg);
+}
+
+$('#loginForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  const btn = $('button[type=submit]', e.target);
+  btn.disabled = true;
+  try {
+    const r = await api('login', $('#lgUser').value.trim(), $('#lgPass').value);
+    S.token = r.token; store('erp_token', r.token);
+    $('#lgPass').value = '';
+    S.tab = null;
+    await reload();
+  } catch (err) { toast(err.message, true); }
+  finally { btn.disabled = false; }
+});
+
+/* ---------------- loading data ---------------- */
+
+async function reload() {
+  const data = await api('getDashboard', S.token);
+  S.data = data;
+  const tabs = ROLE_TABS[data.user.role] || [];
+  if (!S.tab || tabs.indexOf(S.tab) < 0) S.tab = store('erp_tab_' + data.user.role) || tabs[0];
+  if (tabs.indexOf(S.tab) < 0) S.tab = tabs[0];
+  S.dirty.clear();
+  $('#loginView').classList.add('hidden');
+  $('#appView').classList.remove('hidden');
+  renderShell();
+  render();
+}
+
+async function safeReload() {
+  try { await reload(); } catch (e) { if (S.token) toast(e.message, true); }
+}
+
+// background refresh every 60s when nothing is being edited
+setInterval(() => {
+  if (!S.token || !S.data || document.hidden) return;
+  if (['new', 'users', 'settings'].indexOf(S.tab) >= 0) return;
+  if (S.dirty.size || $('.modal-bg') || S.loading) return;
+  const ae = document.activeElement;
+  if (ae && /INPUT|TEXTAREA|SELECT/.test(ae.tagName)) return;
+  reload().catch(() => {});
+}, 60000);
+
+/* ---------------- shell ---------------- */
+
+function queueCount(stage) {
+  return S.data.orders.filter(o => QUEUE_SECTIONS[stage].some(s => s[0] === o.Status && !s[2])).length;
+}
+
+function renderShell() {
+  const d = S.data;
+  $('#companyName').textContent = d.companyName;
+  $('#whoName').textContent = d.user.name;
+  $('#whoRole').textContent = d.user.role;
+  const tabs = ROLE_TABS[d.user.role] || [];
+  $('#tabs').innerHTML = tabs.map(t => {
+    const c = QUEUE_SECTIONS[t] ? queueCount(t) : 0;
+    return '<button data-tab="' + t + '" class="' + (t === S.tab ? 'active' : '') + '">' +
+      h(TAB_LABEL[t]) + (c ? '<span class="count">' + c + '</span>' : '') + '</button>';
+  }).join('');
+  $('#tabs').classList.toggle('hidden', tabs.length < 2);
+}
+
+$('#tabs').addEventListener('click', async e => {
+  const b = e.target.closest('button[data-tab]');
+  if (!b) return;
+  if (S.dirty.size && !(await ask('You have unsaved changes. Leave this screen?', { ok: 'Leave' }))) return;
+  S.dirty.clear();
+  if (b.dataset.tab !== 'new') { S.editing = null; S.formImage = null; S.removeImage = false; }
+  S.tab = b.dataset.tab;
+  store('erp_tab_' + role(), S.tab);
+  renderShell(); render();
+  window.scrollTo(0, 0);
+});
+
+$('#btnRefresh').addEventListener('click', async () => {
+  if (S.dirty.size && !(await ask('Refreshing will discard values you have not saved. Continue?', { ok: 'Refresh' }))) return;
+  safeReload();
+});
+
+$('#btnMenu').addEventListener('click', () => {
+  openModal(
+    '<div class="modal-head"><h3>Account</h3><span class="spacer"></span><button class="btn-sm" data-close>✕</button></div>' +
+    '<p class="muted small">Signed in as <b>' + h(S.data.user.username) + '</b> (' + h(S.data.user.role) + ')</p>' +
+    (S.data.sheetUrl ? '<p><a href="' + h(S.data.sheetUrl) + '" target="_blank" rel="noopener">Open Google Sheet (reports) ↗</a></p>' : '') +
+    '<div class="section-title">Change password</div>' +
+    '<div class="field"><label>Current password</label><input type="password" id="cpOld" autocomplete="current-password"></div>' +
+    '<div class="field"><label>New password (min 6)</label><input type="password" id="cpNew" autocomplete="new-password"></div>' +
+    '<div class="actions"><button class="btn-primary" id="cpSave">Change password</button><span class="spacer"></span>' +
+    '<button class="btn-bad" id="btnLogout">Sign out</button></div>'
+  );
+  $('#cpSave').onclick = async () => {
+    try { await api('changePassword', S.token, $('#cpOld').value, $('#cpNew').value); toast('Password changed.'); closeModal(); }
+    catch (e) { toast(e.message, true); }
+  };
+  $('#btnLogout').onclick = async () => {
+    try { await api('logout', S.token); } catch (e) { /* ignore */ }
+    forceLogout();
+  };
+});
+
+function openModal(html) {
+  $('#modalRoot').innerHTML = '<div class="modal-bg" id="modalBg"><div class="modal">' + html + '</div></div>';
+  $('#modalBg').addEventListener('click', e => {
+    if (e.target.id === 'modalBg' || e.target.closest('[data-close]')) closeModal();
+  });
+}
+function closeModal() { $('#modalRoot').innerHTML = ''; }
+
+/* ---------------- render router ---------------- */
+
+function render() {
+  const main = $('#main');
+  switch (S.tab) {
+    case 'new': renderForm(main); break;
+    case 'orders': renderOrders(main); break;
+    case 'production': case 'packing': case 'dispatch': renderQueue(main, S.tab); break;
+    case 'users': renderUsers(main); break;
+    case 'settings': renderSettings(main); break;
+    default: main.innerHTML = '<div class="empty">No screens for this role.</div>';
+  }
+}
+
+/* =====================================================================
+ * ALL ORDERS (sales / accounts / admin)
+ * ===================================================================== */
+
+function renderOrders(main) {
+  const counts = {};
+  S.data.statuses.forEach(s => counts[s] = 0);
+  S.data.orders.forEach(o => counts[o.Status] = (counts[o.Status] || 0) + 1);
+  main.innerHTML =
+    '<div class="pipeline">' +
+    '<button class="stage ' + (S.filter.status === '' ? 'active' : '') + '" data-st=""><div class="n">' + S.data.orders.length + '</div><div class="l">All orders</div></button>' +
+    S.data.statuses.map(s =>
+      '<button class="stage ' + (S.filter.status === s ? 'active' : '') + '" data-st="' + s + '"><div class="n">' + counts[s] + '</div><div class="l">' + h(STATUS_LABEL[s]) + '</div></button>'
+    ).join('') +
+    '</div>' +
+    '<div class="card">' +
+    '<div class="grid" style="margin-bottom:12px">' +
+    '<div><label>Search</label><input id="fQ" placeholder="Order no, customer, mobile, sweet…" value="' + h(S.filter.q) + '"></div>' +
+    '<div><label>Delivery from</label><input type="date" id="fFrom" value="' + h(S.filter.from) + '"></div>' +
+    '<div><label>Delivery to</label><input type="date" id="fTo" value="' + h(S.filter.to) + '"></div>' +
+    '</div>' +
+    '<div class="row" style="margin-bottom:8px"><span class="spacer"></span><button class="btn-sm" id="ordersPrint">🖨 Print list</button></div>' +
+    '<div id="ordersTable"></div></div>';
+
+  $$('.stage', main).forEach(b => b.onclick = () => { S.filter.status = b.dataset.st; renderOrders(main); });
+  $('#fQ').oninput = e => { S.filter.q = e.target.value; renderOrdersTable(); };
+  $('#fFrom').onchange = e => { S.filter.from = e.target.value; renderOrdersTable(); };
+  $('#fTo').onchange = e => { S.filter.to = e.target.value; renderOrdersTable(); };
+  $('#ordersPrint').onclick = () => printOrdersList(filteredOrders());
+  renderOrdersTable();
+}
+
+function filteredOrders() {
+  const q = S.filter.q.trim().toLowerCase();
+  return S.data.orders.filter(o => {
+    if (S.filter.status && o.Status !== S.filter.status) return false;
+    if (S.filter.from && o.DeliveryDate < S.filter.from) return false;
+    if (S.filter.to && o.DeliveryDate > S.filter.to) return false;
+    if (q) {
+      const hay = [o.OrderID, o.CustomerName, o.Mobile, o.GSTIN, o.GSTBusinessName, o.CreatedBy, itemsSummary(o)].join(' ').toLowerCase();
+      if (hay.indexOf(q) < 0) return false;
+    }
+    return true;
+  });
+}
+
+function renderOrdersTable() {
+  const list = filteredOrders();
+  const totW = list.reduce((t, o) => t + (Number(o.TotalWeight) || 0), 0);
+  const totB = list.reduce((t, o) => t + (Number(o.TotalBoxes) || 0), 0);
+  const money = showPrices();
+  // cancelled orders are listed but not added to the money total
+  const totM = list.reduce((t, o) => t + (o.Status === 'CANCELLED' ? 0 : orderMoney(o).grandTotal), 0);
+  $('#ordersTable').innerHTML = !list.length ? '<div class="empty">No orders match.</div>' :
+    '<div class="table-wrap"><table><thead><tr>' +
+    '<th>Order</th><th>Customer</th><th>Delivery</th><th>Items</th><th class="num">Kg</th><th class="num">Boxes</th>' +
+    (money ? '<th class="num">Grand total</th>' : '') + '<th>Status</th>' +
+    '</tr></thead><tbody>' +
+    list.map(o =>
+      '<tr class="click" data-id="' + h(o.OrderID) + '">' +
+      '<td><b>' + h(o.OrderID) + '</b><div class="muted small">' + h(o.CreatedBy || '') + '</div></td>' +
+      '<td>' + h(o.CustomerName) + '<div class="muted small">' + h(o.Mobile || '') + '</div></td>' +
+      '<td>' + dueHtml(o) + '</td>' +
+      '<td class="small">' + h(itemsSummary(o)) + '</td>' +
+      '<td class="num">' + fmt(o.TotalWeight) + '</td>' +
+      '<td class="num">' + fmt(o.TotalBoxes) + '</td>' +
+      (money ? '<td class="num">' + inr(orderMoney(o).grandTotal) + '</td>' : '') +
+      '<td>' + statusBadge(o.Status) + '</td></tr>'
+    ).join('') +
+    '</tbody><tfoot><tr><td colspan="4">' + list.length + ' order(s)</td><td class="num">' + fmt(totW) + '</td><td class="num">' + fmt(totB) + '</td>' +
+    (money ? '<td class="num">' + inr(totM) + '</td>' : '') + '<td></td></tr></tfoot></table></div>';
+  $$('#ordersTable tr.click').forEach(tr => tr.onclick = () => openDetail(tr.dataset.id));
+}
+
+/* ---------------- order detail modal ---------------- */
+
+function kv(pairs) {
+  return '<dl class="kv">' + pairs.filter(p => p[1] !== undefined && p[1] !== null && p[1] !== '')
+    .map(p => '<dt>' + h(p[0]) + '</dt><dd>' + (p[2] ? p[1] : h(p[1])) + '</dd>').join('') + '</dl>';
+}
+function imageHtml(o) {
+  if (!o.PackingImageID) return '';
+  return '<a href="' + h(o.PackingImageURL) + '" target="_blank" rel="noopener">' +
+    '<img class="thumb" alt="Packing reference" src="https://drive.google.com/thumbnail?id=' + encodeURIComponent(o.PackingImageID) + '&sz=w400" ' +
+    'onerror="this.replaceWith(document.createTextNode(\'Open packing image ↗\'))"></a>';
+}
+function stamp(by, at) { return by ? by + ' · ' + at : ''; }
+function moneyBox(m) {
+  return '<div class="money-box">' +
+    '<div><span>Subtotal</span><b>' + inr(m.subtotal) + '</b></div>' +
+    '<div><span>Discount (' + fmt(m.pct) + '%)</span><b>− ' + inr(m.discount) + '</b></div>' +
+    '<div class="grand"><span>Grand total</span><b>' + inr(m.grandTotal) + '</b></div></div>';
+}
+
+function openDetail(id) {
+  const o = findOrder(id);
+  if (!o) return;
+  const r = role();
+  const canEdit = (r === 'sales' && o.Status === 'NEW') || (r === 'admin' && o.Status !== 'DELIVERED' && o.Status !== 'CANCELLED');
+  const canCancel = (r === 'sales' && o.Status === 'NEW') || (r === 'admin' && o.Status !== 'DELIVERED' && o.Status !== 'CANCELLED');
+  const money = showPrices(), m = orderMoney(o);
+
+  openModal(
+    '<div class="modal-head"><h3>' + h(o.OrderID) + '</h3> ' + statusBadge(o.Status) +
+    '<span class="spacer"></span><button class="btn-sm no-print" id="dPrint">🖨 Print</button>' +
+    '<button class="btn-sm no-print" data-close>✕</button></div>' +
+    '<div class="row" style="margin-bottom:8px">' + dueHtml(o) + progressBadge('Production', o.ProductionStatus) + progressBadge('Packing', o.PackingStatus) + '</div>' +
+    '<div class="section-title">Customer</div>' +
+    kv([['Name', o.CustomerName], ['Mobile', o.Mobile ? '<a href="tel:' + h(o.Mobile) + '">' + h(o.Mobile) + '</a>' : '', true],
+        ['Address', o.DeliveryAddress], ['Delivery', niceDate(o.DeliveryDate) + ' ' + niceTime(o.DeliveryTime)],
+        ['GSTIN', o.GSTIN], ['GST name', o.GSTBusinessName], ['Billing address', o.GSTAddress],
+        ['Created', stamp(o.CreatedBy, o.CreatedAt)], ['Sales remarks', o.SalesRemarks]]) +
+    '<div class="section-title">Items</div>' +
+    '<div class="table-wrap"><table><thead><tr><th>#</th><th>Sweet</th><th class="num">Boxes</th><th class="num">Box kg</th><th class="num">Kg</th><th class="num">Produced kg</th><th class="num">Packed boxes</th>' +
+    (money ? '<th class="num">Rate/kg</th><th class="num">Amount</th>' : '') + '</tr></thead><tbody>' +
+    o.items.map(it => '<tr><td>' + it.ItemNo + '</td><td>' + h(it.SweetName) + (it.ItemNotes ? '<div class="muted small">' + h(it.ItemNotes) + '</div>' : '') + '</td>' +
+      '<td class="num">' + fmt(it.Boxes) + '</td><td class="num">' + fmt(it.BoxWeight) + '</td><td class="num">' + fmt(it.Weight) + '</td>' +
+      '<td class="num">' + fmt(it.ProducedWeight) + '</td><td class="num">' + fmt(it.PackedBoxes) + '</td>' +
+      (money ? '<td class="num">' + inr(it.Rate) + '</td><td class="num">' + inr(round2(it.Weight * it.Rate)) + '</td>' : '') + '</tr>').join('') +
+    '</tbody><tfoot><tr><td colspan="4">Total</td><td class="num">' + fmt(o.TotalWeight) + '</td><td></td><td class="num">' + fmt(o.TotalBoxes) + ' boxes</td>' +
+    (money ? '<td></td><td class="num">' + inr(m.subtotal) + '</td>' : '') + '</tr></tfoot></table></div>' +
+    (money ? moneyBox(m) : '') +
+    (o.PackingDetails || o.PackingImageID ? '<div class="section-title">Packing instructions</div>' +
+      (o.PackingDetails ? '<p style="white-space:pre-line;margin-top:0">' + h(o.PackingDetails) + '</p>' : '') + imageHtml(o) : '') +
+    '<div class="section-title">Progress</div>' +
+    kv([['Production accepted', stamp(o.ProdAcceptedBy, o.ProdAcceptedAt)], ['Production finished', stamp(o.ProdFinishedBy, o.ProdFinishedAt)],
+        ['Production remarks', o.ProductionRemarks],
+        ['Packing accepted', stamp(o.PackAcceptedBy, o.PackAcceptedAt)], ['Packing finished', stamp(o.PackFinishedBy, o.PackFinishedAt)],
+        ['Packing remarks', o.PackingRemarks],
+        ['Dispatch accepted', stamp(o.DispAcceptedBy, o.DispAcceptedAt)], ['Vehicle', o.VehicleNo], ['Driver', [o.DriverName, o.DriverMobile].filter(Boolean).join(' · ')],
+        ['Dispatched', stamp(o.DispatchedBy, o.DispatchedAt)], ['Dispatch remarks', o.DispatchRemarks],
+        ['Delivered', stamp(o.DeliveredBy, o.DeliveredAt)], ['Received by', o.ReceivedBy], ['Delivery remarks', o.DeliveryRemarks]]) +
+    '<div class="section-title">History</div><ul class="timeline" id="histList"><li class="muted">Loading…</li></ul>' +
+    '<div class="actions no-print">' +
+    (canEdit ? '<button class="btn-primary" id="dEdit">Edit order</button>' : '') +
+    (canCancel ? '<button class="btn-bad" id="dCancel">Cancel order</button>' : '') +
+    '</div>' +
+    (r === 'admin' ? '<div class="no-print"><div class="section-title">Admin: move order to any stage</div><div class="row">' +
+      '<select id="dSt" style="max-width:240px">' + S.data.statuses.map(s => '<option value="' + s + '"' + (s === o.Status ? ' selected' : '') + '>' + h(STATUS_LABEL[s]) + '</option>').join('') + '</select>' +
+      '<input id="dReason" placeholder="Reason" style="max-width:260px"><button id="dSetSt">Apply</button></div></div>' : '')
+  );
+
+  api('getOrderHistory', S.token, id).then(list => {
+    const el = $('#histList');
+    if (!el) return;
+    el.innerHTML = list.length ? list.map(x =>
+      '<li><b>' + h(ACTION_LABEL[x.Action] || x.Action) + '</b> — ' + h(x.Username) + ' <span class="muted">(' + h(x.Role) + ') · ' + h(x.Timestamp) + '</span>' +
+      (x.Details && x.Action !== 'ORDER_EDITED' ? '<div class="muted">' + h(x.Details) + '</div>' : '') + '</li>').join('') : '<li class="muted">No history.</li>';
+  }).catch(() => {});
+
+  $('#dPrint').onclick = () => printOrder(o, ['production', 'packing', 'dispatch'].indexOf(r) >= 0 ? r : 'full');
+  if ($('#dEdit')) $('#dEdit').onclick = () => {
+    closeModal();
+    S.editing = JSON.parse(JSON.stringify(o)); S.formImage = null; S.removeImage = false;
+    S.tab = 'new'; renderShell(); render(); window.scrollTo(0, 0);
+  };
+  if ($('#dCancel')) $('#dCancel').onclick = async () => {
+    const reason = await ask('Cancel order ' + o.OrderID + '? This removes it from all queues.', { input: true, required: true, placeholder: 'Reason for cancelling', ok: 'Cancel order', danger: true });
+    if (!reason) return;
+    try { await api('cancelOrder', S.token, o.OrderID, reason); toast(o.OrderID + ' cancelled.'); closeModal(); safeReload(); }
+    catch (e) { toast(e.message, true); }
+  };
+  if ($('#dSetSt')) $('#dSetSt').onclick = async () => {
+    const st = $('#dSt').value;
+    if (st === o.Status) return;
+    if (!(await ask('Move ' + o.OrderID + ' from "' + STATUS_LABEL[o.Status] + '" to "' + STATUS_LABEL[st] + '"?', { ok: 'Move' }))) return;
+    try { await api('adminSetStatus', S.token, o.OrderID, st, $('#dReason').value); toast('Status updated.'); closeModal(); safeReload(); }
+    catch (e) { toast(e.message, true); }
+  };
+}
+
+/* =====================================================================
+ * NEW / EDIT ORDER (sales / admin)
+ * ===================================================================== */
+
+function renderForm(main) {
+  const o = S.editing;
+  const v = k => o ? h(o[k] || '') : '';
+  const hasGst = o && (o.GSTIN || o.GSTBusinessName || o.GSTAddress);
+  main.innerHTML =
+    '<form class="card" id="orderForm" novalidate>' +
+    '<div class="row"><h2>' + (o ? 'Edit order ' + h(o.OrderID) : 'New order') + '</h2><span class="spacer"></span>' +
+    (o ? '<button type="button" id="fCancelEdit">Discard changes</button>' : '') + '</div>' +
+
+    '<div class="section-title">Customer</div>' +
+    '<div class="grid">' +
+    '<div class="field"><label>Customer name <span class="req">*</span></label><input name="customerName" required value="' + v('CustomerName') + '"></div>' +
+    '<div class="field"><label>Mobile no. <span class="req">*</span></label><input name="mobile" type="tel" inputmode="numeric" maxlength="13" placeholder="10 digit mobile" required value="' + v('Mobile') + '"></div>' +
+    '</div>' +
+    '<div class="grid">' +
+    '<div class="field"><label>Delivery date <span class="req">*</span></label><input name="deliveryDate" type="date" required ' + (o ? '' : 'min="' + todayStr(0) + '"') + ' value="' + v('DeliveryDate') + '"></div>' +
+    '<div class="field"><label>Delivery time <span class="req">*</span></label><input name="deliveryTime" type="time" required value="' + v('DeliveryTime') + '"></div>' +
+    '</div>' +
+    '<div class="field"><label>Delivery address <span class="req">*</span></label><textarea name="deliveryAddress" required>' + v('DeliveryAddress') + '</textarea></div>' +
+
+    '<div class="section-title">Sweets</div>' +
+    '<datalist id="sweetList">' + S.data.sweets.map(s => '<option value="' + h(s) + '">').join('') + '</datalist>' +
+    '<div id="itemRows"></div>' +
+    '<div class="row" style="margin-top:10px"><button type="button" id="addItem">+ Add sweet</button><span class="spacer"></span>' +
+    '<div class="totals" id="formTotals"></div></div>' +
+    '<p class="muted small" style="margin:4px 0 0">Weight fills automatically from boxes × box weight. Type your own weight for loose (unboxed) orders. Amount = weight × rate per kg.</p>' +
+    '<div class="grid" style="margin-top:12px;align-items:end">' +
+    '<div class="field"><label>Discount (%)</label><input name="discountPercent" id="fDiscount" type="number" min="0" max="100" step="0.01" inputmode="decimal" placeholder="0" value="' + (o && Number(o.DiscountPercent) ? h(o.DiscountPercent) : '') + '"></div>' +
+    '<div id="formMoney"></div>' +
+    '</div>' +
+
+    '<div class="section-title">GST details (optional)</div>' +
+    '<label class="check"><input type="checkbox" id="gstToggle"' + (hasGst ? ' checked' : '') + '> Customer needs GST invoice</label>' +
+    '<div id="gstBox" class="' + (hasGst ? '' : 'hidden') + '" style="margin-top:10px">' +
+    '<div class="grid">' +
+    '<div class="field"><label>GSTIN</label><input name="gstin" maxlength="15" style="text-transform:uppercase" placeholder="27ABCDE1234F1Z5" value="' + v('GSTIN') + '"></div>' +
+    '<div class="field"><label>Business / legal name</label><input name="gstBusinessName" value="' + v('GSTBusinessName') + '"></div>' +
+    '</div>' +
+    '<div class="field"><label>Billing address (if different)</label><textarea name="gstAddress">' + v('GSTAddress') + '</textarea></div>' +
+    '</div>' +
+
+    '<div class="section-title">Packing (optional)</div>' +
+    '<div class="field"><label>Packing details</label><textarea name="packingDetails" placeholder="Box type, ribbon, labels, message card…">' + v('PackingDetails') + '</textarea></div>' +
+    '<div class="field"><label>Packing reference image</label><input type="file" id="fImage" accept="image/*"></div>' +
+    '<div id="imgPreview" class="row"></div>' +
+
+    '<div class="section-title">Other</div>' +
+    '<div class="field"><label>Remarks for factory</label><textarea name="salesRemarks">' + v('SalesRemarks') + '</textarea></div>' +
+
+    '<div class="actions"><button type="submit" class="btn-primary btn-lg" id="fSubmit">' + (o ? 'Save changes' : 'Submit to production') + '</button></div>' +
+    '</form>';
+
+  const rows = $('#itemRows');
+  if (o && o.items.length) o.items.forEach(it => addItemRow(rows, it));
+  else addItemRow(rows);
+  updateTotals();
+  renderImagePreview();
+
+  $('#addItem').onclick = () => { addItemRow(rows); $$('.item-row', rows).pop().querySelector('input').focus(); };
+  $('#fDiscount').oninput = updateTotals;
+  $('#gstToggle').onchange = e => $('#gstBox').classList.toggle('hidden', !e.target.checked);
+  $('#fImage').onchange = async e => {
+    const f = e.target.files[0];
+    if (!f) return;
+    try { S.formImage = await readImage(f); S.removeImage = false; renderImagePreview(); }
+    catch (err) { toast('Could not read image: ' + err.message, true); }
+  };
+  if ($('#fCancelEdit')) $('#fCancelEdit').onclick = () => { S.editing = null; S.formImage = null; S.tab = (ROLE_TABS[role()].indexOf('orders') >= 0 ? 'orders' : S.tab); renderShell(); render(); };
+  $('#orderForm').onsubmit = submitOrder;
+}
+
+function addItemRow(container, it) {
+  it = it || {};
+  const div = document.createElement('div');
+  div.className = 'item-row';
+  const manual = it.Weight && Math.abs((it.Boxes || 0) * (it.BoxWeight || 0) - it.Weight) > 0.0005;
+  div.dataset.manual = manual ? '1' : '0';
+  div.innerHTML =
+    '<div class="f-sweet"><label>Sweet name</label><input data-f="sweetName" list="sweetList" placeholder="Select or type" value="' + h(it.SweetName || '') + '"></div>' +
+    '<div><label>No. of boxes</label><input data-f="boxes" type="number" min="0" step="1" inputmode="numeric" value="' + h(it.Boxes || '') + '"></div>' +
+    '<div><label>One box wt (kg)</label><input data-f="boxWeight" type="number" min="0" step="0.001" inputmode="decimal" placeholder="e.g. 0.5" value="' + h(it.BoxWeight || '') + '"></div>' +
+    '<div><label>Weight (kg)</label><input data-f="weight" type="number" min="0" step="0.001" inputmode="decimal" value="' + h(it.Weight || '') + '"></div>' +
+    '<div><label>Rate (₹/kg)</label><input data-f="rate" type="number" min="0" step="0.01" inputmode="decimal" value="' + h(it.Rate || '') + '"></div>' +
+    '<div><label>Amount (₹)</label><input data-amount readonly tabindex="-1" class="readonly"></div>' +
+    '<div class="f-notes"><label>Item notes</label><input data-f="notes" placeholder="Optional" value="' + h(it.ItemNotes || '') + '"></div>' +
+    '<div><button type="button" class="btn-sm btn-bad" data-remove title="Remove">✕</button></div>';
+  container.appendChild(div);
+
+  const q = f => div.querySelector('[data-f="' + f + '"]');
+  const auto = () => {
+    if (div.dataset.manual === '1') return;
+    const b = parseFloat(q('boxes').value), w = parseFloat(q('boxWeight').value);
+    q('weight').value = (b > 0 && w > 0) ? Math.round(b * w * 1000) / 1000 : '';
+  };
+  q('boxes').addEventListener('input', () => { auto(); updateTotals(); });
+  q('boxWeight').addEventListener('input', () => { auto(); updateTotals(); });
+  q('weight').addEventListener('input', e => { div.dataset.manual = e.target.value ? '1' : '0'; if (!e.target.value) auto(); updateTotals(); });
+  q('rate').addEventListener('input', updateTotals);
+  div.querySelector('[data-remove]').onclick = () => {
+    if ($$('.item-row', container).length === 1) { $$('input', div).forEach(i => i.value = ''); div.dataset.manual = '0'; }
+    else div.remove();
+    updateTotals();
+  };
+}
+
+function collectItems() {
+  return $$('#itemRows .item-row').map(div => {
+    const g = f => div.querySelector('[data-f="' + f + '"]').value;
+    return { sweetName: g('sweetName').trim(), boxes: g('boxes'), boxWeight: g('boxWeight'), weight: g('weight'), rate: g('rate'), notes: g('notes').trim() };
+  });
+}
+
+function updateTotals() {
+  const items = collectItems();
+  const w = items.reduce((t, i) => t + (parseFloat(i.weight) || 0), 0);
+  const b = items.reduce((t, i) => t + (parseInt(i.boxes, 10) || 0), 0);
+  $('#formTotals').innerHTML = '<span>Total: ' + fmt(w) + ' kg</span><span>' + b + ' box(es)</span>';
+  $$('#itemRows .item-row').forEach((div, n) => {
+    const amt = round2((parseFloat(items[n].weight) || 0) * (parseFloat(items[n].rate) || 0));
+    div.querySelector('[data-amount]').value = amt ? inr(amt) : '';
+  });
+  const m = calcTotals(items.map(i => ({ Weight: parseFloat(i.weight), Rate: parseFloat(i.rate) })), parseFloat($('#fDiscount').value));
+  $('#formMoney').innerHTML = moneyBox(m);
+}
+
+function renderImagePreview() {
+  const box = $('#imgPreview');
+  if (!box) return;
+  const o = S.editing;
+  if (S.formImage) {
+    box.innerHTML = (S.formImage.preview ? '<img class="thumb" src="' + S.formImage.preview + '">' : '<span>' + h(S.formImage.name) + '</span>') +
+      '<button type="button" class="btn-sm" id="imgClear">Remove</button>';
+    $('#imgClear').onclick = () => { S.formImage = null; $('#fImage').value = ''; renderImagePreview(); };
+  } else if (o && o.PackingImageID && !S.removeImage) {
+    box.innerHTML = imageHtml(o) + '<button type="button" class="btn-sm" id="imgClear">Remove current image</button>';
+    $('#imgClear').onclick = () => { S.removeImage = true; renderImagePreview(); };
+  } else {
+    box.innerHTML = '';
+  }
+}
+
+/** Reads an image file and shrinks it to max 1600px JPEG so uploads stay fast on mobile data. */
+function readImage(file) {
+  return new Promise((resolve, reject) => {
+    if (file.size > 15 * 1024 * 1024) { reject(new Error('Image is larger than 15 MB.')); return; }
+    const fr = new FileReader();
+    fr.onerror = () => reject(new Error('read failed'));
+    fr.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        const max = 1600, sc = Math.min(1, max / Math.max(img.width, img.height));
+        const c = document.createElement('canvas');
+        c.width = Math.round(img.width * sc); c.height = Math.round(img.height * sc);
+        c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+        const url = c.toDataURL('image/jpeg', 0.82);
+        resolve({ name: file.name.replace(/\.[^.]+$/, '') + '.jpg', mimeType: 'image/jpeg', data: url.split(',')[1], preview: url });
+      };
+      img.onerror = () => {
+        // browser can't decode (e.g. HEIC on Android) — upload original
+        resolve({ name: file.name, mimeType: file.type || 'image/heic', data: String(fr.result).split(',')[1], preview: null });
+      };
+      img.src = fr.result;
+    };
+    fr.readAsDataURL(file);
+  });
+}
+
+async function submitOrder(e) {
+  e.preventDefault();
+  const f = e.target;
+  const val = n => (f.elements[n] ? f.elements[n].value.trim() : '');
+  const gst = $('#gstToggle').checked;
+  const payload = {
+    orderId: S.editing ? S.editing.OrderID : '',
+    customerName: val('customerName'), mobile: val('mobile'),
+    deliveryDate: val('deliveryDate'), deliveryTime: val('deliveryTime'), deliveryAddress: val('deliveryAddress'),
+    gstin: gst ? val('gstin') : '', gstBusinessName: gst ? val('gstBusinessName') : '', gstAddress: gst ? val('gstAddress') : '',
+    packingDetails: val('packingDetails'), salesRemarks: val('salesRemarks'),
+    discountPercent: val('discountPercent'),
+    items: collectItems(),
+    image: S.formImage ? { name: S.formImage.name, mimeType: S.formImage.mimeType, data: S.formImage.data } : null,
+    removeImage: !!S.removeImage
+  };
+
+  // quick client checks (server validates again)
+  const errs = [];
+  if (!payload.customerName) errs.push('Customer name is required.');
+  if (!/^(\+?91)?[6-9]\d{9}$/.test(payload.mobile.replace(/[\s-]/g, ''))) errs.push('Enter a valid 10 digit mobile number.');
+  if (!payload.deliveryDate) errs.push('Delivery date is required.');
+  if (!payload.deliveryTime) errs.push('Delivery time is required.');
+  if (!payload.deliveryAddress) errs.push('Delivery address is required.');
+  const disc = Number(payload.discountPercent || 0);
+  if (!(disc >= 0 && disc <= 100)) errs.push('Discount must be between 0 and 100 %.');
+  const filled = payload.items.filter(i => i.sweetName || i.weight || i.boxes);
+  if (!filled.length) errs.push('Add at least one sweet.');
+  filled.forEach((i, n) => {
+    if (!i.sweetName) errs.push('Item ' + (n + 1) + ': choose a sweet.');
+    if (!(parseFloat(i.weight) > 0)) errs.push('Item ' + (n + 1) + ': enter boxes × box weight, or a weight.');
+  });
+  if (errs.length) { toast(errs.join('\n'), true); return; }
+
+  const btn = $('#fSubmit');
+  btn.disabled = true; btn.textContent = 'Saving…';
+  try {
+    const r = await api('saveOrder', S.token, payload);
+    const wasEdit = !!S.editing;
+    toast(wasEdit ? 'Order ' + r.orderId + ' updated.' : 'Order ' + r.orderId + ' sent to production ✓');
+    S.editing = null; S.formImage = null; S.removeImage = false;
+    if (wasEdit && ROLE_TABS[role()].indexOf('orders') >= 0) S.tab = 'orders';
+    await reload();
+    window.scrollTo(0, 0);
+  } catch (err) {
+    toast(err.message, true);
+    btn.disabled = false; btn.textContent = S.editing ? 'Save changes' : 'Submit to production';
+  }
+}
+
+/* =====================================================================
+ * WORK QUEUES (production / packing / dispatch)
+ * ===================================================================== */
+
+function renderQueue(main, stage) {
+  const sections = QUEUE_SECTIONS[stage];
+  let html = '';
+  let any = false;
+  sections.forEach(sec => {
+    const list = S.data.orders.filter(o => o.Status === sec[0]);
+    if (!list.length) return;
+    any = true;
+    html += '<div class="section-title">' + h(sec[1]) + ' (' + list.length + ')' + (sec[2] ? ' <span class="badge">View only</span>' : '') + '</div>';
+    html += list.map(o => sec[2] ? upcomingCard(o, stage) : stage === 'production' ? prodCard(o) : stage === 'packing' ? packCard(o) : dispCard(o)).join('');
+  });
+  main.innerHTML = any
+    ? '<div class="row" style="margin-bottom:4px"><span class="spacer"></span><button class="btn-sm" id="queuePrint">🖨 Print list</button></div>' + html
+    : '<div class="empty">🎉 Nothing waiting in ' + h(TAB_LABEL[stage]) + ' right now.</div>';
+  if ($('#queuePrint')) $('#queuePrint').onclick = () => printQueueList(stage);
+
+  // mark cards dirty when values change so refresh doesn't wipe them
+  $$('.card[data-id]', main).forEach(card => {
+    card.addEventListener('input', () => S.dirty.add(card.dataset.id));
+  });
+  $$('[data-act]', main).forEach(b => b.onclick = () => queueAction(b.closest('.card').dataset.id, b.dataset.act, b));
+  $$('[data-open]', main).forEach(b => b.onclick = () => openDetail(b.dataset.open));
+  $$('[data-print]', main).forEach(b => b.onclick = () => printOrder(findOrder(b.dataset.print), stage));
+}
+
+function cardHead(o, extra) {
+  return '<div class="card-head"><span class="order-id">' + h(o.OrderID) + '</span>' + statusBadge(o.Status) + (extra || '') +
+    '<span class="spacer"></span>' + dueHtml(o) + '</div>' +
+    '<div class="row small" style="margin-bottom:6px"><span><b>' + h(o.CustomerName) + '</b></span>' +
+    '<span class="muted">' + fmt(o.TotalWeight) + ' kg · ' + fmt(o.TotalBoxes) + ' box(es)</span>' +
+    '<span class="spacer"></span><button class="btn-sm" data-print="' + h(o.OrderID) + '">🖨 Print</button>' +
+    '<button class="btn-sm" data-open="' + h(o.OrderID) + '">Details</button></div>' +
+    (o.SalesRemarks ? '<div class="small" style="background:var(--warn-soft);padding:6px 10px;border-radius:8px;margin:6px 0">📝 ' + h(o.SalesRemarks) + '</div>' : '');
+}
+
+/** Order that has not reached this stage yet: shown so the team can plan ahead, but no actions. */
+function upcomingCard(o, stage) {
+  return '<div class="card card-upcoming" data-id="' + h(o.OrderID) + '">' +
+    cardHead(o, progressBadge('Production', o.ProductionStatus) + progressBadge('Packing', o.PackingStatus)) +
+    '<div class="table-wrap"><table><thead><tr><th>Sweet</th><th class="num">Boxes × kg</th><th class="num">Ordered kg</th></tr></thead><tbody>' +
+    o.items.map(it => '<tr><td>' + h(it.SweetName) + (it.ItemNotes ? '<div class="muted small">' + h(it.ItemNotes) + '</div>' : '') + '</td>' +
+      '<td class="num small">' + (it.Boxes ? fmt(it.Boxes) + ' × ' + fmt(it.BoxWeight) : 'Loose') + '</td>' +
+      '<td class="num">' + fmt(it.Weight) + '</td></tr>').join('') +
+    '</tbody></table></div>' +
+    '<div class="small muted" style="margin-top:8px">👁 Currently <b>' + h(STATUS_LABEL[o.Status] || o.Status) + '</b>. ' +
+    'You can act on it once it reaches ' + h(TAB_LABEL[stage]) + '.</div></div>';
+}
+
+function prodCard(o) {
+  const active = o.Status === 'IN_PRODUCTION';
+  return '<div class="card" data-id="' + h(o.OrderID) + '">' + cardHead(o, progressBadge('Production', o.ProductionStatus)) +
+    '<div class="table-wrap"><table><thead><tr><th>Sweet</th><th class="num">Boxes × kg</th><th class="num">Ordered kg</th><th class="num">Produced kg</th><th></th></tr></thead><tbody>' +
+    o.items.map(it => {
+      const done = it.ProducedWeight >= it.Weight - 1e-9;
+      return '<tr><td>' + h(it.SweetName) + (it.ItemNotes ? '<div class="muted small">' + h(it.ItemNotes) + '</div>' : '') + '</td>' +
+        '<td class="num small">' + (it.Boxes ? fmt(it.Boxes) + ' × ' + fmt(it.BoxWeight) : 'Loose') + '</td>' +
+        '<td class="num"><b>' + fmt(it.Weight) + '</b></td>' +
+        '<td class="num">' + (active
+          ? '<input type="number" min="0" step="0.001" inputmode="decimal" data-item="' + it.ItemNo + '" data-target="' + it.Weight + '" value="' + (it.ProducedWeight || '') + '" style="max-width:110px;text-align:right">'
+          : fmt(it.ProducedWeight)) + '</td>' +
+        '<td>' + (it.ProducedWeight ? '<span class="badge ' + (done ? 'b-full' : 'b-partial') + '">' + (done ? 'Full' : 'Partial') + '</span>' : '') + '</td></tr>';
+    }).join('') +
+    '</tbody></table></div>' +
+    (active ? '<div class="field" style="margin-top:10px"><label>Production remarks</label><textarea data-remarks>' + h(o.ProductionRemarks || '') + '</textarea></div>' : '') +
+    '<div class="actions">' +
+    (o.Status === 'NEW' ? '<button class="btn-primary btn-lg" data-act="PROD_ACCEPT">Accept</button>' : '') +
+    (active ? '<button data-act="FILL">Fill full weight</button><button class="btn-info" data-act="PROD_SAVE">Save partial</button>' +
+      '<button class="btn-ok btn-lg" data-act="PROD_FINISH">Finish → Packing</button>' : '') +
+    '</div></div>';
+}
+
+function packCard(o) {
+  const active = o.Status === 'IN_PACKING';
+  return '<div class="card" data-id="' + h(o.OrderID) + '">' + cardHead(o, progressBadge('Production', o.ProductionStatus) + progressBadge('Packing', o.PackingStatus)) +
+    (o.PackingDetails || o.PackingImageID ? '<div class="row" style="align-items:flex-start;margin:8px 0">' +
+      (o.PackingDetails ? '<div style="flex:1;min-width:200px;white-space:pre-line"><b class="small muted">PACKING INSTRUCTIONS</b><br>' + h(o.PackingDetails) + '</div>' : '') +
+      imageHtml(o) + '</div>' : '') +
+    (o.ProductionRemarks ? '<div class="small muted">Production: ' + h(o.ProductionRemarks) + '</div>' : '') +
+    '<div class="table-wrap"><table><thead><tr><th>Sweet</th><th class="num">Ordered kg</th><th class="num">Produced kg</th><th class="num">Boxes × kg</th><th class="num">Packed boxes</th></tr></thead><tbody>' +
+    o.items.map(it =>
+      '<tr><td>' + h(it.SweetName) + (it.ItemNotes ? '<div class="muted small">' + h(it.ItemNotes) + '</div>' : '') + '</td>' +
+      '<td class="num">' + fmt(it.Weight) + '</td>' +
+      '<td class="num">' + (it.ProducedWeight < it.Weight - 1e-9 ? '<span style="color:var(--warn);font-weight:700">' + fmt(it.ProducedWeight) + '</span>' : fmt(it.ProducedWeight)) + '</td>' +
+      '<td class="num"><b>' + (it.Boxes ? fmt(it.Boxes) + ' × ' + fmt(it.BoxWeight) : 'Loose') + '</b></td>' +
+      '<td class="num">' + (active
+        ? '<input type="number" min="0" step="1" inputmode="numeric" data-item="' + it.ItemNo + '" data-target="' + it.Boxes + '" value="' + (it.PackedBoxes || '') + '" style="max-width:100px;text-align:right">'
+        : fmt(it.PackedBoxes)) + '</td></tr>'
+    ).join('') +
+    '</tbody></table></div>' +
+    (active ? '<div class="field" style="margin-top:10px"><label>Packing remarks</label><textarea data-remarks>' + h(o.PackingRemarks || '') + '</textarea></div>' : '') +
+    '<div class="actions">' +
+    (o.Status === 'PRODUCED' ? '<button class="btn-primary btn-lg" data-act="PACK_ACCEPT">Accept</button>' : '') +
+    (active ? '<button data-act="FILL">Fill all boxes</button><button class="btn-info" data-act="PACK_SAVE">Save partial</button>' +
+      '<button class="btn-ok btn-lg" data-act="PACK_FINISH">Finish → Dispatch</button>' : '') +
+    '</div></div>';
+}
+
+function dispCard(o) {
+  const addr = o.DeliveryAddress || '';
+  let body =
+    kv([['Mobile', o.Mobile ? '<a href="tel:' + h(o.Mobile) + '">📞 ' + h(o.Mobile) + '</a>' : '', true],
+        ['Address', addr ? h(addr) + ' <a class="small" target="_blank" rel="noopener" href="https://www.google.com/maps/search/?api=1&query=' + encodeURIComponent(addr) + '">Map ↗</a>' : '', true],
+        ['Items', o.items.map(it => it.SweetName + ' — ' + (it.Boxes ? fmt(it.PackedBoxes || it.Boxes) + ' box(es)' : fmt(it.Weight) + ' kg loose')).join(', ')],
+        ['Packing', o.PackingRemarks]]);
+  let actions = '';
+  if (o.Status === 'PACKED') {
+    actions = '<button class="btn-primary btn-lg" data-act="DISP_ACCEPT">Accept</button>';
+  } else if (o.Status === 'IN_DISPATCH') {
+    body += '<div class="grid" style="margin-top:10px">' +
+      '<div class="field"><label>Vehicle no. <span class="req">*</span></label><input data-f="vehicleNo" style="text-transform:uppercase" value="' + h(o.VehicleNo || '') + '"></div>' +
+      '<div class="field"><label>Driver name <span class="req">*</span></label><input data-f="driverName" value="' + h(o.DriverName || '') + '"></div>' +
+      '<div class="field"><label>Driver mobile</label><input data-f="driverMobile" type="tel" inputmode="numeric" value="' + h(o.DriverMobile || '') + '"></div>' +
+      '</div><div class="field"><label>Dispatch remarks</label><input data-f="remarks" value="' + h(o.DispatchRemarks || '') + '"></div>';
+    actions = '<button class="btn-ok btn-lg" data-act="DISP_SEND">Mark dispatched</button>';
+  } else if (o.Status === 'DISPATCHED') {
+    body += '<div class="small muted" style="margin-top:6px">🚚 ' + h(o.VehicleNo) + ' · ' + h(o.DriverName) + (o.DriverMobile ? ' · <a href="tel:' + h(o.DriverMobile) + '">' + h(o.DriverMobile) + '</a>' : '') + ' · left ' + h(o.DispatchedAt) + '</div>' +
+      '<div class="grid" style="margin-top:10px">' +
+      '<div class="field"><label>Received by</label><input data-f="receivedBy" placeholder="Name of person who received"></div>' +
+      '<div class="field"><label>Delivery remarks</label><input data-f="remarks"></div></div>';
+    actions = '<button class="btn-ok btn-lg" data-act="DELIVERED">Mark delivered</button>';
+  }
+  return '<div class="card" data-id="' + h(o.OrderID) + '">' + cardHead(o) + body + '<div class="actions">' + actions + '</div></div>';
+}
+
+async function queueAction(id, act, btn) {
+  const card = $('.card[data-id="' + CSS.escape(id) + '"]');
+  const o = findOrder(id);
+
+  if (act === 'FILL') {
+    $$('input[data-item]', card).forEach(i => i.value = i.dataset.target);
+    S.dirty.add(id);
+    return;
+  }
+
+  const data = {};
+  const itemInputs = $$('input[data-item]', card);
+  if (/^(PROD|PACK)_(SAVE|FINISH)$/.test(act)) {
+    const key = act.indexOf('PROD') === 0 ? 'producedWeight' : 'packedBoxes';
+    data.items = itemInputs.map(i => { const x = { itemNo: Number(i.dataset.item) }; x[key] = i.value; return x; });
+    const rem = $('[data-remarks]', card);
+    if (rem) data.remarks = rem.value;
+  }
+  $$('[data-f]', card).forEach(i => data[i.dataset.f] = i.value.trim());
+
+  // confirmations
+  if (act === 'PROD_FINISH' || act === 'PACK_FINISH') {
+    const isProd = act === 'PROD_FINISH';
+    const short = itemInputs.filter(i => (parseFloat(i.value) || 0) < Number(i.dataset.target) - 1e-9);
+    if (isProd && !itemInputs.some(i => parseFloat(i.value) > 0)) { toast('Enter the produced weight first (or use "Fill full weight").', true); return; }
+    const allowed = isProd ? S.data.allowPartialProduction : S.data.allowPartialPacking;
+    if (short.length && !allowed && !isAdmin()) {
+      toast((isProd ? 'Production' : 'Packing') + ' is partial. Partial finish is turned off by admin — complete it or use "Save partial".', true);
+      return;
+    }
+    const msg = short.length
+      ? 'Some items are PARTIAL (' + short.length + ' of ' + itemInputs.length + ').\nFinish anyway and send ' + id + ' to ' + (isProd ? 'packing' : 'dispatch') + '?'
+      : 'Finish ' + id + ' and send it to ' + (isProd ? 'packing' : 'dispatch') + '?';
+    if (!(await ask(msg, { ok: 'Finish' }))) return;
+  }
+  if (act === 'DISP_SEND') {
+    if (!data.vehicleNo || !data.driverName) { toast('Vehicle number and driver name are required.', true); return; }
+    if (!(await ask('Mark ' + id + ' as dispatched in vehicle ' + data.vehicleNo.toUpperCase() + '?', { ok: 'Dispatch' }))) return;
+  }
+  if (act === 'DELIVERED' && !(await ask('Mark ' + id + ' (' + o.CustomerName + ') as delivered?', { ok: 'Delivered' }))) return;
+
+  const buttons = $$('button', card);
+  buttons.forEach(b => b.disabled = true);
+  try {
+    await api('performAction', S.token, id, act, data);
+    S.dirty.delete(id);
+    toast({
+      PROD_ACCEPT: id + ' accepted — start production.', PROD_SAVE: 'Progress saved.', PROD_FINISH: id + ' sent to packing ✓',
+      PACK_ACCEPT: id + ' accepted for packing.', PACK_SAVE: 'Progress saved.', PACK_FINISH: id + ' sent to dispatch ✓',
+      DISP_ACCEPT: id + ' accepted for dispatch.', DISP_SEND: id + ' dispatched ✓', DELIVERED: id + ' delivered ✓'
+    }[act] || 'Done.');
+    await reload();
+  } catch (e) {
+    toast(e.message, true);
+    buttons.forEach(b => b.disabled = false);
+  }
+}
+
+/* =====================================================================
+ * PRINTING — each stage prints only what it works with
+ * ===================================================================== */
+
+/** Renders html into #printRoot, prints it, then clears it. The rest of the page is hidden by @media print. */
+function printHtml(html) {
+  let root = $('#printRoot');
+  if (!root) { root = document.createElement('div'); root.id = 'printRoot'; document.body.appendChild(root); }
+  root.innerHTML = html;
+  document.body.classList.add('printing');
+  const done = () => { document.body.classList.remove('printing'); root.innerHTML = ''; window.removeEventListener('afterprint', done); };
+  window.addEventListener('afterprint', done);
+  // wait (max 3s) for images such as the packing reference so they appear on paper
+  const imgs = $$('img', root).filter(i => !i.complete);
+  Promise.race([
+    Promise.all(imgs.map(i => new Promise(r => { i.onload = i.onerror = r; }))),
+    new Promise(r => setTimeout(r, 3000))
+  ]).then(() => window.print());
+}
+
+function printHead(title, sub) {
+  return '<div class="p-head"><div><div class="p-company">' + h(S.data.companyName) + '</div><div class="p-title">' + h(title) + '</div></div>' +
+    '<div class="p-meta">' + (sub || '') + '<div>Printed ' + h(todayStr(0)) + ' ' + h(new Date().toTimeString().slice(0, 5)) + '</div>' +
+    '<div>By ' + h(S.data.user.name) + '</div></div></div>';
+}
+function printSign(labels) {
+  return '<div class="p-sign">' + labels.map(l => '<div><div class="p-line"></div>' + h(l) + '</div>').join('') + '</div>';
+}
+function boxesText(it) { return it.Boxes ? fmt(it.Boxes) + ' × ' + fmt(it.BoxWeight) + ' kg' : 'Loose'; }
+
+/** kind: production | packing | dispatch | full */
+function printOrder(o, kind) {
+  if (!o) return;
+  const money = kind === 'full' && showPrices();
+  const due = niceDate(o.DeliveryDate) + ' ' + niceTime(o.DeliveryTime);
+  let info = [['Customer', o.CustomerName], ['Delivery', due]];
+  if (kind === 'dispatch' || kind === 'full') info = info.concat([['Mobile', o.Mobile], ['Address', o.DeliveryAddress]]);
+  if (kind === 'full') info = info.concat([['GSTIN', o.GSTIN], ['GST name', o.GSTBusinessName], ['Billing address', o.GSTAddress], ['Created', stamp(o.CreatedBy, o.CreatedAt)]]);
+  if (kind === 'dispatch') info = info.concat([['Vehicle', o.VehicleNo], ['Driver', [o.DriverName, o.DriverMobile].filter(Boolean).join(' · ')]]);
+
+  let head, row, foot = '';
+  if (kind === 'production') {
+    head = ['#', 'Sweet', 'Boxes', 'Ordered kg', 'Produced kg'];
+    row = it => [it.ItemNo, sweetCell(it), boxesText(it), fmt(it.Weight), it.ProducedWeight ? fmt(it.ProducedWeight) : ''];
+    foot = ['', 'Total', '', fmt(o.TotalWeight), ''];
+  } else if (kind === 'packing') {
+    head = ['#', 'Sweet', 'Ordered kg', 'Produced kg', 'Boxes', 'Packed boxes'];
+    row = it => [it.ItemNo, sweetCell(it), fmt(it.Weight), fmt(it.ProducedWeight), boxesText(it), it.PackedBoxes ? fmt(it.PackedBoxes) : ''];
+    foot = ['', 'Total', fmt(o.TotalWeight), '', fmt(o.TotalBoxes) + ' box(es)', ''];
+  } else if (kind === 'dispatch') {
+    head = ['#', 'Sweet', 'Boxes', 'Kg'];
+    row = it => [it.ItemNo, sweetCell(it), it.Boxes ? fmt(it.PackedBoxes || it.Boxes) : 'Loose', fmt(it.Weight)];
+    foot = ['', 'Total', fmt(o.TotalBoxes), fmt(o.TotalWeight)];
+  } else {
+    head = ['#', 'Sweet', 'Boxes', 'Kg'].concat(money ? ['Rate/kg', 'Amount'] : []);
+    row = it => [it.ItemNo, sweetCell(it), boxesText(it), fmt(it.Weight)].concat(money ? [inr(it.Rate), inr(round2(it.Weight * it.Rate))] : []);
+    foot = ['', 'Total', fmt(o.TotalBoxes) + ' box(es)', fmt(o.TotalWeight)].concat(money ? ['', inr(orderMoney(o).subtotal)] : []);
+  }
+  const numCols = { '#': 1, 'Sweet': 1 };
+  const th = head.map(c => '<th' + (numCols[c] ? '' : ' class="num"') + '>' + h(c) + '</th>').join('');
+  const td = cells => cells.map((c, i) => '<td' + (i < 2 ? '' : ' class="num"') + '>' + (i === 1 ? c : h(c)) + '</td>').join('');
+
+  const remarks = [['Sales remarks', o.SalesRemarks]];
+  if (kind !== 'production') remarks.push(['Production remarks', o.ProductionRemarks]);
+  if (kind === 'dispatch' || kind === 'full') remarks.push(['Packing remarks', o.PackingRemarks]);
+  if (kind === 'full') remarks.push(['Dispatch remarks', o.DispatchRemarks]);
+
+  const signs = {
+    production: ['Produced by', 'Checked by'], packing: ['Packed by', 'Checked by'],
+    dispatch: ['Driver', 'Received by (name, sign & date)'], full: ['Prepared by', 'Authorised signatory']
+  }[kind];
+
+  printHtml('<div class="pdoc">' +
+    printHead(PRINT_TITLE[kind], '<div class="p-id">' + h(o.OrderID) + '</div><div>' + h(STATUS_LABEL[o.Status] || o.Status) + '</div>') +
+    kv(info) +
+    '<table class="p-table"><thead><tr>' + th + '</tr></thead><tbody>' +
+    o.items.map(it => '<tr>' + td(row(it)) + '</tr>').join('') +
+    '</tbody><tfoot><tr>' + td(foot) + '</tr></tfoot></table>' +
+    (money ? moneyBox(orderMoney(o)) : '') +
+    (kind === 'packing' && (o.PackingDetails || o.PackingImageID)
+      ? '<div class="section-title">Packing instructions</div>' + (o.PackingDetails ? '<p style="white-space:pre-line;margin-top:0">' + h(o.PackingDetails) + '</p>' : '') +
+        (o.PackingImageID ? '<img class="thumb" src="https://drive.google.com/thumbnail?id=' + encodeURIComponent(o.PackingImageID) + '&sz=w400">' : '')
+      : '') +
+    kv(remarks) +
+    printSign(signs) + '</div>');
+}
+function sweetCell(it) { return h(it.SweetName) + (it.ItemNotes ? '<div class="muted small">' + h(it.ItemNotes) + '</div>' : ''); }
+
+/** Work list of a queue tab (orders this user can act on; upcoming orders are left out). */
+function printQueueList(stage) {
+  const sections = QUEUE_SECTIONS[stage].filter(s => !s[2]);
+  const withAddr = stage === 'dispatch';
+  let body = '', count = 0;
+  sections.forEach(sec => {
+    const list = S.data.orders.filter(o => o.Status === sec[0]);
+    if (!list.length) return;
+    count += list.length;
+    body += '<div class="section-title">' + h(sec[1]) + ' (' + list.length + ')</div>' +
+      '<table class="p-table"><thead><tr><th>Order</th><th>Customer</th><th>Delivery</th><th>Items</th><th class="num">Kg</th><th class="num">Boxes</th>' +
+      (withAddr ? '<th>Address</th>' : '') + '</tr></thead><tbody>' +
+      list.map(o => '<tr><td><b>' + h(o.OrderID) + '</b></td><td>' + h(o.CustomerName) + (withAddr && o.Mobile ? '<div class="small">' + h(o.Mobile) + '</div>' : '') + '</td>' +
+        '<td>' + h(niceDate(o.DeliveryDate) + ' ' + niceTime(o.DeliveryTime)) + '</td>' +
+        '<td class="small">' + o.items.map(it => h(it.SweetName) + ' — ' + fmt(it.Weight) + ' kg' + (it.Boxes ? ' / ' + fmt(it.Boxes) + ' box' : '')).join('<br>') + '</td>' +
+        '<td class="num">' + fmt(o.TotalWeight) + '</td><td class="num">' + fmt(o.TotalBoxes) + '</td>' +
+        (withAddr ? '<td class="small">' + h(o.DeliveryAddress) + '</td>' : '') + '</tr>').join('') +
+      '</tbody></table>';
+  });
+  if (!count) { toast('Nothing to print — no orders to work on in ' + TAB_LABEL[stage] + '.', true); return; }
+  printHtml('<div class="pdoc">' + printHead(TAB_LABEL[stage] + ' work list', '<div class="p-id">' + count + ' order(s)</div>') + body + '</div>');
+}
+
+/** All Orders list as currently filtered (with grand totals for sales / accounts / admin). */
+function printOrdersList(list) {
+  if (!list.length) { toast('No orders to print.', true); return; }
+  const money = showPrices();
+  const live = list.filter(o => o.Status !== 'CANCELLED');
+  const f = S.filter;
+  const sub = '<div class="p-id">' + list.length + ' order(s)</div>' +
+    (f.status ? '<div>' + h(STATUS_LABEL[f.status]) + '</div>' : '') +
+    (f.from || f.to ? '<div>Delivery ' + h(niceDate(f.from) || '…') + ' – ' + h(niceDate(f.to) || '…') + '</div>' : '');
+  printHtml('<div class="pdoc">' + printHead('Orders', sub) +
+    '<table class="p-table"><thead><tr><th>Order</th><th>Customer</th><th>Delivery</th><th>Items</th><th class="num">Kg</th><th class="num">Boxes</th>' +
+    (money ? '<th class="num">Subtotal</th><th class="num">Disc.</th><th class="num">Grand total</th>' : '') + '<th>Status</th></tr></thead><tbody>' +
+    list.map(o => {
+      const m = orderMoney(o);
+      return '<tr><td><b>' + h(o.OrderID) + '</b></td><td>' + h(o.CustomerName) + (o.GSTIN ? '<div class="small">' + h(o.GSTIN) + '</div>' : '') + '</td>' +
+        '<td>' + h(niceDate(o.DeliveryDate)) + '</td><td class="small">' + h(itemsSummary(o)) + '</td>' +
+        '<td class="num">' + fmt(o.TotalWeight) + '</td><td class="num">' + fmt(o.TotalBoxes) + '</td>' +
+        (money ? '<td class="num">' + inr(m.subtotal) + '</td><td class="num">' + (m.pct ? fmt(m.pct) + '%' : '—') + '</td><td class="num"><b>' + inr(m.grandTotal) + '</b></td>' : '') +
+        '<td>' + h(STATUS_LABEL[o.Status] || o.Status) + '</td></tr>';
+    }).join('') +
+    '</tbody><tfoot><tr><td colspan="4">Total' + (money && live.length < list.length ? ' (cancelled orders not counted in ₹)' : '') + '</td>' +
+    '<td class="num">' + fmt(list.reduce((t, o) => t + (Number(o.TotalWeight) || 0), 0)) + '</td>' +
+    '<td class="num">' + fmt(list.reduce((t, o) => t + (Number(o.TotalBoxes) || 0), 0)) + '</td>' +
+    (money ? '<td class="num">' + inr(live.reduce((t, o) => t + orderMoney(o).subtotal, 0)) + '</td>' +
+      '<td class="num">' + inr(live.reduce((t, o) => t + orderMoney(o).discount, 0)) + '</td>' +
+      '<td class="num">' + inr(live.reduce((t, o) => t + orderMoney(o).grandTotal, 0)) + '</td>' : '') +
+    '<td></td></tr></tfoot></table></div>');
+}
+
+/* =====================================================================
+ * ADMIN: USERS
+ * ===================================================================== */
+
+async function loadAdmin() {
+  S.admin = await api('adminGetData', S.token);
+  return S.admin;
+}
+
+async function renderUsers(main) {
+  main.innerHTML = '<div class="empty">Loading…</div>';
+  try { if (!S.admin) await loadAdmin(); } catch (e) { main.innerHTML = '<div class="empty">' + h(e.message) + '</div>'; return; }
+  const A = S.admin, u = S.editUser;
+  main.innerHTML =
+    '<div class="card"><div class="row"><h2>Users</h2><span class="spacer"></span><button id="uNew" class="btn-primary">+ Add user</button></div>' +
+    '<div class="table-wrap" style="margin-top:10px"><table><thead><tr><th>Username</th><th>Name</th><th>Role</th><th>Status</th><th>Last login</th><th></th></tr></thead><tbody>' +
+    A.users.map((x, i) => '<tr><td><b>' + h(x.Username) + '</b></td><td>' + h(x.FullName) + '</td><td><span class="badge">' + h(x.Role) + '</span></td>' +
+      '<td>' + (x.Active ? '<span class="badge b-full">Active</span>' : '<span class="badge st-CANCELLED">Disabled</span>') + '</td>' +
+      '<td class="small muted">' + h(x.LastLogin || '—') + '</td><td><button class="btn-sm" data-u="' + i + '">Edit</button></td></tr>').join('') +
+    '</tbody></table></div></div>' +
+    '<form class="card" id="userForm"><h3>' + (u ? 'Edit user: ' + h(u.Username) : 'Add user') + '</h3><div class="grid" style="margin-top:10px">' +
+    '<div class="field"><label>Username</label><input name="Username" autocapitalize="none" ' + (u ? 'readonly' : '') + ' value="' + h(u ? u.Username : '') + '"></div>' +
+    '<div class="field"><label>Full name</label><input name="FullName" value="' + h(u ? u.FullName : '') + '"></div>' +
+    '<div class="field"><label>Role</label><select name="Role">' + A.roles.map(r => '<option' + (u && u.Role === r ? ' selected' : '') + '>' + r + '</option>').join('') + '</select></div>' +
+    '<div class="field"><label>' + (u ? 'New password (leave blank to keep)' : 'Password (min 6)') + '</label><input name="Password" type="text" autocomplete="off"></div>' +
+    '</div><label class="check"><input type="checkbox" name="Active"' + (!u || u.Active ? ' checked' : '') + '> Active (can sign in)</label>' +
+    '<div class="actions"><button type="submit" class="btn-primary">Save user</button>' + (u ? '<button type="button" id="uClear">Cancel</button>' : '') + '</div></form>' +
+    '<div class="card small muted"><b>Role access</b><br>' +
+    'sales — create orders, edit/cancel until production accepts, track all orders<br>' +
+    'production — accept, save partial weight, finish → packing<br>' +
+    'packing — accept, save partial boxes, finish → dispatch; sees orders still in production (view only)<br>' +
+    'dispatch — accept, assign vehicle & mark dispatched, mark delivered; sees orders still in production / packing (view only)<br>' +
+    'accounts — view all orders, prices, discount, grand total, GST details and full history (read-only)<br>' +
+    'admin — everything, plus users, masters, settings and moving orders to any stage</div>';
+
+  $$('[data-u]', main).forEach(b => b.onclick = () => { S.editUser = A.users[Number(b.dataset.u)]; renderUsers(main); $('#userForm').scrollIntoView({ behavior: 'smooth' }); });
+  $('#uNew').onclick = () => { S.editUser = null; renderUsers(main); $('#userForm [name=Username]').focus(); };
+  if ($('#uClear')) $('#uClear').onclick = () => { S.editUser = null; renderUsers(main); };
+  $('#userForm').onsubmit = async e => {
+    e.preventDefault();
+    const f = e.target.elements;
+    const payload = { Username: f.Username.value.trim(), FullName: f.FullName.value.trim(), Role: f.Role.value, Password: f.Password.value, Active: f.Active.checked };
+    try { S.admin = await api('adminSaveUser', S.token, payload); S.editUser = null; toast('User saved.'); renderUsers(main); }
+    catch (err) { toast(err.message, true); }
+  };
+}
+
+/* =====================================================================
+ * ADMIN: MASTERS & SETTINGS
+ * ===================================================================== */
+
+async function renderSettings(main) {
+  main.innerHTML = '<div class="empty">Loading…</div>';
+  try { if (!S.admin) await loadAdmin(); } catch (e) { main.innerHTML = '<div class="empty">' + h(e.message) + '</div>'; return; }
+  const A = S.admin;
+  const st = {}; A.settings.forEach(x => st[x.Key] = x.Value);
+  const on = k => (st[k] === true || String(st[k]).toUpperCase() === 'TRUE') ? ' checked' : '';
+  main.innerHTML =
+    '<form class="card" id="setForm"><h2>Settings</h2><div class="grid" style="margin-top:12px">' +
+    '<div class="field"><label>Company name</label><input name="COMPANY_NAME" value="' + h(st.COMPANY_NAME) + '"></div>' +
+    '<div class="field"><label>Order number prefix</label><input name="ORDER_PREFIX" maxlength="8" value="' + h(st.ORDER_PREFIX) + '"></div>' +
+    '<div class="field"><label>Drive folder ID for images</label><input name="DRIVE_FOLDER_ID" value="' + h(st.DRIVE_FOLDER_ID) + '"></div>' +
+    '</div>' +
+    '<label class="check"><input type="checkbox" name="ALLOW_PARTIAL_PRODUCTION_FINISH"' + on('ALLOW_PARTIAL_PRODUCTION_FINISH') + '> Production can finish with partial weight</label>' +
+    '<label class="check" style="margin-top:8px"><input type="checkbox" name="ALLOW_PARTIAL_PACKING_FINISH"' + on('ALLOW_PARTIAL_PACKING_FINISH') + '> Packing can finish with partial boxes</label>' +
+    '<label class="check" style="margin-top:8px"><input type="checkbox" name="SHARE_IMAGES_BY_LINK"' + on('SHARE_IMAGES_BY_LINK') + '> Share packing images by link (needed for thumbnails)</label>' +
+    '<div class="actions"><button type="submit" class="btn-primary">Save settings</button></div></form>' +
+
+    '<div class="card"><div class="row"><h2>Sweets master</h2><span class="spacer"></span><button id="swAdd">+ Add sweet</button></div>' +
+    '<p class="muted small">These appear as suggestions in the sales order form. Untick to hide without deleting.</p>' +
+    '<div id="swRows"></div><div class="actions"><button class="btn-primary" id="swSave">Save sweets</button></div></div>';
+
+  const swRows = $('#swRows');
+  const addSw = (s) => {
+    const d = document.createElement('div');
+    d.className = 'row'; d.style.marginBottom = '8px';
+    d.innerHTML = '<input data-sw-name style="flex:1;min-width:160px" value="' + h(s ? s.SweetName : '') + '">' +
+      '<label class="check" style="margin:0"><input type="checkbox" data-sw-active' + (!s || s.Active ? ' checked' : '') + '> Active</label>' +
+      '<button type="button" class="btn-sm btn-bad">✕</button>';
+    d.querySelector('button').onclick = () => d.remove();
+    swRows.appendChild(d);
+    return d;
+  };
+  A.sweets.forEach(addSw);
+  $('#swAdd').onclick = () => addSw().querySelector('input').focus();
+  $('#swSave').onclick = async () => {
+    const list = $$('.row', swRows).map(r => ({ SweetName: $('[data-sw-name]', r).value.trim(), Active: $('[data-sw-active]', r).checked })).filter(x => x.SweetName);
+    try { S.admin = await api('adminSaveSweets', S.token, list); toast('Sweets saved.'); await reload(); }
+    catch (e) { toast(e.message, true); }
+  };
+  $('#setForm').onsubmit = async e => {
+    e.preventDefault();
+    const f = e.target.elements;
+    const payload = {
+      COMPANY_NAME: f.COMPANY_NAME.value, ORDER_PREFIX: f.ORDER_PREFIX.value, DRIVE_FOLDER_ID: f.DRIVE_FOLDER_ID.value,
+      ALLOW_PARTIAL_PRODUCTION_FINISH: f.ALLOW_PARTIAL_PRODUCTION_FINISH.checked,
+      ALLOW_PARTIAL_PACKING_FINISH: f.ALLOW_PARTIAL_PACKING_FINISH.checked,
+      SHARE_IMAGES_BY_LINK: f.SHARE_IMAGES_BY_LINK.checked
+    };
+    try { S.admin = await api('adminSaveSettings', S.token, payload); toast('Settings saved.'); await reload(); }
+    catch (err) { toast(err.message, true); }
+  };
+}
+
+/* ---------------- boot ---------------- */
+
+(function boot() {
+  S.token = store('erp_token');
+  if (S.token) reload().catch(e => { if (S.token) forceLogout(e.message); });
+  else showLogin();
+})();
+</script>

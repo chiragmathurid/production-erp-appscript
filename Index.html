@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <title><?= appName ?></title>
+  <?!= include('Styles'); ?>
+</head>
+<body>
+  <div id="loader" class="hidden"></div>
+
+  <!-- Login -->
+  <div id="loginView" class="login-wrap hidden">
+    <form class="card login" id="loginForm" autocomplete="on">
+      <h1><?= appName ?></h1>
+      <p class="muted small">Sign in with the username and password given by your admin.</p>
+      <div class="field">
+        <label for="lgUser">Username</label>
+        <input id="lgUser" name="username" autocomplete="username" autocapitalize="none" required>
+      </div>
+      <div class="field">
+        <label for="lgPass">Password</label>
+        <input id="lgPass" name="password" type="password" autocomplete="current-password" required>
+      </div>
+      <button class="btn-primary btn-lg" style="width:100%" type="submit">Sign in</button>
+    </form>
+  </div>
+
+  <!-- App -->
+  <div id="appView" class="hidden">
+    <header class="top">
+      <div class="brand" id="companyName"><?= appName ?></div>
+      <div class="spacer"></div>
+      <div class="who"><span id="whoName"></span> <span class="role badge" id="whoRole"></span></div>
+      <button class="btn-sm" id="btnRefresh" title="Refresh">↻</button>
+      <button class="btn-sm" id="btnMenu" title="Account">☰</button>
+    </header>
+    <nav class="tabs" id="tabs"></nav>
+    <main id="main"></main>
+  </div>
+
+  <div id="modalRoot"></div>
+  <div id="toast" class="hidden"></div>
+
+  <?!= include('App'); ?>
+</body>
+</html>
